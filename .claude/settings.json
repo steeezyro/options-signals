@@ -1,0 +1,17 @@
+{
+  "permissions": {
+    "allow": [
+      "Bash(python3 -c \"import sys, numpy, scipy, pandas; print\\(sys.version\\); print\\(numpy.__version__, scipy.__version__, pandas.__version__\\)\")",
+      "Bash(python3 -c \"import optionsmarkets; print\\(optionsmarkets.__file__\\)\")",
+      "Bash(python3 -m venv .venv)",
+      "Bash(.venv/bin/python -m pip install -q --upgrade pip)",
+      "Bash(.venv/bin/python -m pip install -q -e \".[dev]\")",
+      "Bash(.venv/bin/python -c \"import numpy,scipy,pandas; print\\('ok', numpy.__version__, scipy.__version__, pandas.__version__\\)\")",
+      "Bash(.venv/bin/python -m pytest -q)",
+      "Bash(.venv/bin/python examples/end_to_end.py)",
+      "Bash(timeout 25 .venv/bin/python -m pip download --no-deps -q -d /tmp/_probe yfinance)",
+      "Bash(echo \"EXIT=$?\")",
+      "Read(//tmp/**)"
+    ]
+  }
+}

@@ -1,0 +1,34 @@
+# Python
+__pycache__/
+*.py[cod]
+*.egg-info/
+build/
+dist/
+.eggs/
+
+# Environments
+.venv/
+venv/
+env/
+
+# Tooling caches
+.pytest_cache/
+.ruff_cache/
+.mypy_cache/
+.coverage
+htmlcov/
+coverage.xml
+
+# Generated runtime output: market-data snapshots and the outcome ledger
+journal/
+
+# Third-party clone (narumiruna/yfinance-mcp), not part of this project
+yfinance-mcp/
+
+# Scratch
+_to_delete/
+
+# OS / editor
+.DS_Store
+.idea/
+*.swp
