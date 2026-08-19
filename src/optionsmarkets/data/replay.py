@@ -24,6 +24,7 @@ statement than "we were careful".
 from __future__ import annotations
 
 import json
+import re
 from bisect import bisect_right
 from dataclasses import dataclass, field
 from datetime import date, datetime, timezone
@@ -53,6 +54,39 @@ def _parse_stamp(name: str) -> datetime | None:
     return None
 
 
+def _recorded_symbol(path: Path) -> str | None:
+    """The underlying a recording was made FOR, from its ``meta.args``.
+
+    The filename carries only ``{stamp}_{method}``, so the symbol lives inside
+    the file.  ``RecordingProvider`` writes ``{"meta": ..., "payload": ...}`` in
+    that order, so the meta block sits in the first few hundred bytes and a head
+    read avoids parsing 600 KB of chain JSON per file at index time -- measured
+    132 files, 5.2 MB, where full parsing costs ~1.4 s and this costs ~4 ms.
+
+    Falls back to a full parse if the head read cannot find a complete meta
+    object, and returns None for genuinely symbol-less calls such as
+    ``risk_free_curve`` and ``market_open``.
+    """
+    def _sym(meta) -> str | None:
+        args = (meta or {}).get("args") or []
+        return str(args[0]) if args else None
+
+    try:
+        with path.open("rb") as fh:
+            head = fh.read(2048).decode("utf-8", "replace")
+        m = re.search(r'"meta"\s*:\s*\{', head)
+        if m:
+            depth, i = 1, m.end()
+            while i < len(head) and depth:
+                depth += (head[i] == "{") - (head[i] == "}")
+                i += 1
+            if not depth:
+                return _sym(json.loads(head[m.end() - 1:i]))
+        return _sym(json.loads(path.read_text()).get("meta"))
+    except (OSError, ValueError):
+        return None
+
+
 @dataclass
 class ReplayProvider:
     """Serve a :class:`~optionsmarkets.data.mcp_adapters.RecordingProvider` journal.
@@ -70,7 +104,8 @@ class ReplayProvider:
     """
     path: Path
     strict: bool = True
-    _index: dict[str, list[tuple[datetime, Path]]] = field(default_factory=dict, repr=False)
+    _index: dict[str, list[tuple[datetime, Path, str | None]]] = field(
+        default_factory=dict, repr=False)
     _cursor: datetime | None = field(default=None, repr=False)
 
     def __post_init__(self):
@@ -83,7 +118,7 @@ class ReplayProvider:
             if ts is None:
                 continue
             method = f.stem.split("_", 1)[1] if "_" in f.stem else f.stem
-            self._index.setdefault(method, []).append((ts, f))
+            self._index.setdefault(method, []).append((ts, f, _recorded_symbol(f)))
         for v in self._index.values():
             v.sort(key=lambda kv: kv[0])
         if not self._index.get("option_chain"):
@@ -92,10 +127,14 @@ class ReplayProvider:
                 f"there is nothing to replay")
         self._cursor = self.timeline()[0]
 
+    def symbols(self) -> set[str]:
+        """Every underlying with a recorded chain in this directory."""
+        return {s for _, _, s in self._index.get("option_chain", []) if s}
+
     # ---- cursor ----------------------------------------------------------
     def timeline(self) -> list[datetime]:
         """Every recorded chain-snapshot time, in order.  The backtest's clock."""
-        return [ts for ts, _ in self._index["option_chain"]]
+        return [ts for ts, _, _ in self._index["option_chain"]]
 
     def seek(self, when: datetime) -> "ReplayProvider":
         self._cursor = when if when.tzinfo else when.replace(tzinfo=timezone.utc)
@@ -105,8 +144,32 @@ class ReplayProvider:
     def cursor(self) -> datetime:
         return self._cursor
 
-    def _latest(self, method: str):
+    def _latest(self, method: str, symbol: str | None = None):
+        """Most recent recording of ``method`` at or before the cursor.
+
+        ``symbol`` is not decoration.  ``RecordingProvider`` names files
+        ``{stamp}_{method}.json`` with no underlying in them, so one directory
+        collecting several tickers interleaves them, and serving the newest
+        recording regardless of who asked hands SPY's caller whatever happened
+        to be written last.  That is a silent wrong answer -- it does not raise,
+        it just backtests a different instrument -- so an unfiltered read is
+        refused rather than approximated.  Observed 2026-08-18: a collector run
+        over SPY/QQQ/IWM wrote 24 files into one flat directory, after which
+        ``daily_bars("SPY", ...)`` returned IWM's bars.
+        """
         entries = self._index.get(method, [])
+        if symbol is not None:
+            known = {s for _, _, s in entries if s}
+            if known:
+                filtered = [e for e in entries if e[2] == symbol]
+                if not filtered and self.strict:
+                    raise LookAheadError(
+                        f"no '{method}' recordings for {symbol!r} in {self.path}; "
+                        f"it holds {sorted(known)}. Serving another underlying's "
+                        f"data would not raise -- it would silently backtest the "
+                        f"wrong instrument. Record {symbol} or point --snapshots "
+                        f"at its own directory.")
+                entries = filtered
         if not entries:
             if self.strict:
                 raise LookAheadError(
@@ -114,7 +177,7 @@ class ReplayProvider:
                     f"had this data; a backtest that substitutes a default for it "
                     f"is not replaying the live system.")
             return None
-        stamps = [ts for ts, _ in entries]
+        stamps = [ts for ts, _, _ in entries]
         i = bisect_right(stamps, self._cursor) - 1
         if i < 0:
             if self.strict:
@@ -127,7 +190,7 @@ class ReplayProvider:
 
     # ---- provider surface -----------------------------------------------
     def option_chain(self, symbol: str, expiry: date | None = None) -> ChainSnapshot:
-        rec = self._latest("option_chain")
+        rec = self._latest("option_chain", symbol)
         snap = _chain_from_payload(rec["payload"])
         if expiry is not None:
             snap = ChainSnapshot(snap.underlying, snap.spot, snap.asof, [expiry],
@@ -143,7 +206,7 @@ class ReplayProvider:
         way to guarantee that is to cut here rather than to trust every caller
         to pass the right ``end``.
         """
-        rec = self._latest("daily_bars")
+        rec = self._latest("daily_bars", symbol)
         if rec is None:
             return pd.DataFrame(columns=["open", "high", "low", "close", "volume"])
         df = pd.DataFrame(rec["payload"])
@@ -165,13 +228,13 @@ class ReplayProvider:
         return {float(k): float(v) for k, v in (rec["payload"] or {}).items()}
 
     def dividends(self, symbol: str, start: date, end: date) -> pd.DataFrame:
-        rec = self._latest("dividends")
+        rec = self._latest("dividends", symbol)
         if rec is None:
             return pd.DataFrame()
         return pd.DataFrame(rec["payload"] or [])
 
     def next_earnings(self, symbol: str) -> date | None:
-        rec = self._latest("next_earnings")
+        rec = self._latest("next_earnings", symbol)
         if rec is None or rec["payload"] in (None, "None", ""):
             return None
         try:

@@ -160,6 +160,62 @@ class TestExpirySelection:
         far = Pipeline(SyntheticProvider(asof=ASOF), _cfg(tmp_path / "f")).run(now=ASOF)
         assert near.dte < far.dte
 
+    def test_an_expiry_clear_of_earnings_is_preferred_over_one_that_straddles_it(
+            self, tmp_path):
+        """Selection avoids the event; it does not excuse it.
+
+        Observed live 2026-08-18: MU had earnings in 36 days, 'furthest' picked
+        the 38-DTE expiry, and the run HELD on risk.event_in_window -- while the
+        24- and 31-DTE expiries in the same band expired cleanly before the
+        event. Every name that reports would have been unreachable for the weeks
+        around its own earnings, which is most names most of the time.
+        """
+        prov = SyntheticProvider(asof=ASOF, earnings_in_days=40)
+        cfg = _cfg(tmp_path, target_dte=(21, 60), earnings_unknown_action="block")
+        res = Pipeline(prov, cfg).run(now=ASOF)
+        assert res.dte == 32, (
+            f"picked {res.dte} DTE; the 60-DTE expiry straddles earnings at day 40 "
+            f"and the 32-DTE one does not")
+        assert "risk.event_in_window" not in res.decision.blocked_by
+
+    def test_when_every_in_band_expiry_straddles_earnings_the_gate_still_fires(
+            self, tmp_path):
+        """The selection rule must not become a way around the gate.  With no
+        clean expiry to fall back to, the refusal is the whole point."""
+        prov = SyntheticProvider(asof=ASOF, earnings_in_days=24)
+        cfg = _cfg(tmp_path, target_dte=(28, 45), earnings_unknown_action="block")
+        res = Pipeline(prov, cfg).run(now=ASOF)
+        assert res.action is Action.HOLD
+        assert "risk.event_in_window" in res.decision.blocked_by
+
+    def test_a_listed_but_unquoted_expiry_is_not_selected_over_live_ones(self, tmp_path):
+        """Being listed is not being quoted.
+
+        MA on 2026-08-18 listed a 2026-10-02 expiry carrying ZERO strikes with a
+        two-sided market on both legs. 'furthest' selected it over three live
+        expiries in the same band and the run HELD at data.iv_inversion for want
+        of a slice -- a refusal caused by the selection, not by the market.
+        """
+        import dataclasses
+
+        class DeadFarExpiry(SyntheticProvider):
+            def option_chain(self, symbol, expiry=None):
+                snap = super().option_chain(symbol, expiry)
+                dead = max(e for e in snap.expiries
+                           if 21 <= (e - self.asof.date()).days <= 45)
+                quotes = dict(snap.quotes)
+                quotes[dead] = [dataclasses.replace(q, bid=0.0, ask=0.0)
+                                for q in quotes[dead]]
+                return dataclasses.replace(snap, quotes=quotes)
+
+        # min_holding_days is relaxed only to isolate SELECTION: at 25 DTE the
+        # default leaves 4 days above the 21-DTE time stop, so risk.holding_window
+        # would refuse first and mask what this test is about.
+        cfg = _cfg(tmp_path, min_holding_days=1)
+        res = Pipeline(DeadFarExpiry(asof=ASOF), cfg).run(now=ASOF)
+        assert res.dte == 25, f"selected {res.dte} DTE; the 32-DTE expiry has no market"
+        assert "data.iv_inversion" not in res.decision.blocked_by
+
     def test_no_room_above_the_time_stop_is_refused_by_name(self, tmp_path):
         """A valid band, but the LISTING offers nothing far enough out."""
         class NearOnly(SyntheticProvider):
@@ -277,6 +333,32 @@ class TestReplayNoLookAhead:
         common = a.index.intersection(b.index)
         assert len(common) > 100
         assert np.allclose(a.loc[common, "close"], b.loc[common, "close"])
+
+    def test_a_mixed_directory_never_serves_another_underlyings_data(self, tmp_path):
+        """One directory holding two tickers must not silently cross them.
+
+        ``RecordingProvider`` names files ``{stamp}_{method}.json`` with no
+        underlying in the name, so ``--snapshots journal/snapshots`` collecting
+        several tickers interleaves them in one directory.  Serving the newest
+        recording regardless of who asked is a silent wrong answer: it does not
+        raise, it backtests a different instrument.  Observed 2026-08-18 on real
+        recordings -- ``option_chain("SPY")`` returned IWM at spot 300.67
+        instead of SPY at 768.09, a 2.5x error, with no diagnostic.
+        """
+        d = tmp_path / "mixed"
+        record_synthetic_history(d, days=6, symbol="SPY",
+                                 start=datetime(2026, 3, 2, 20, 0, tzinfo=timezone.utc))
+        # IWM written strictly LATER, so an unfiltered read serves IWM for SPY.
+        record_synthetic_history(d, days=6, symbol="IWM",
+                                 start=datetime(2026, 3, 10, 20, 0, tzinfo=timezone.utc))
+        rp = ReplayProvider(d)
+        assert rp.symbols() == {"SPY", "IWM"}
+        rp.seek(rp.timeline()[-1])
+        assert rp.option_chain("SPY").underlying == "SPY"
+        assert rp.option_chain("IWM").underlying == "IWM"
+        # A ticker with no recordings must refuse rather than substitute.
+        with pytest.raises(LookAheadError, match="would silently backtest"):
+            rp.option_chain("QQQ")
 
     def test_the_chain_spot_agrees_with_the_bar_history(self, recorded):
         rp = ReplayProvider(recorded)

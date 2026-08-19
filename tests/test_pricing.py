@@ -171,3 +171,89 @@ def test_forward_from_parity_recovers_truth():
     assert fit.ok
     assert fit.F == pytest.approx(F, abs=1e-6)
     assert fit.DF == pytest.approx(df, abs=1e-9)
+
+
+def test_constrained_fit_recovers_truth_when_the_curve_supplies_df():
+    """One free parameter instead of two, on data where both answers exist."""
+    T_ = 0.09
+    F = float(black.forward(778.54, 0.043, 0.012, T_))
+    df = float(np.exp(-0.043 * T_))
+    Ks = np.arange(740, 820, 5.0)
+    C = black.price(778.54, Ks, T_, 0.043, 0.012, 0.15, 1)
+    P = black.price(778.54, Ks, T_, 0.043, 0.012, 0.15, -1)
+    fit = implied_forward(Ks, C, P, T_, S_ref=778.54, df_known=df)
+    assert fit.ok
+    assert fit.df_source == "known"
+    assert fit.F == pytest.approx(F, abs=1e-6)
+    assert fit.DF == pytest.approx(df, abs=1e-15), "a supplied DF must pass through untouched"
+
+
+def test_free_fit_absorbs_the_early_exercise_premium_into_the_discount_factor():
+    """The live 2026-08-18 failure, reproduced from first principles.
+
+    American quotes break parity, and the breakage is not noise: the premium
+    sits in whichever leg is in-the-money, so it grows with |K - F| and enters
+    the regression as SLOPE. The slope IS the discount factor, so the free fit
+    returns DF > 1 -- a negative implied rate -- and refuses the slice.  Holding
+    DF at its known value removes the degree of freedom the bias was living in.
+    """
+    from optionsmarkets.pricing.american import leisen_reimer
+
+    S, r, q, sig, T_ = 100.0, 0.045, 0.0, 0.30, 0.25
+    F = float(black.forward(S, r, q, T_))
+    df = float(np.exp(-r * T_))
+    Ks = np.arange(91.0, 110.0, 1.0)
+    C = np.array([leisen_reimer(S, k, T_, r, q, sig, 1, n=201) for k in Ks])
+    P = np.array([leisen_reimer(S, k, T_, r, q, sig, -1, n=201) for k in Ks])
+
+    free = implied_forward(Ks, C, P, T_, S_ref=S, atm_window=0.10)
+    assert free.DF > 1.0001, f"expected the American bias to push DF above 1, got {free.DF}"
+    assert free.r_implied < 0.0
+    assert not free.ok, "this is the state that blocked every live decision"
+
+    fixed = implied_forward(Ks, C, P, T_, S_ref=S, atm_window=0.10, df_known=df)
+    assert fixed.ok
+    # American puts are worth more than European ones, so P is inflated and the
+    # recovered forward sits BELOW the truth. Second-order, and bounded: the
+    # residual bias is what keeps the fit restricted to the ATM core.
+    assert fixed.F == pytest.approx(F, rel=2e-3)
+    assert fixed.F < F
+
+
+def test_a_single_corrupt_quote_cannot_rotate_the_forward():
+    """Observed on MA 2026-09-18: the K=610 put printed 110.55 x 117.00 while
+    its neighbours at 605 and 615 printed 31.00 x 35.70 and 39.40 x 44.40.  One
+    such row moved the fitted forward by 4 points and took r2 from 0.9998 to
+    0.88."""
+    T_ = 0.09
+    F = float(black.forward(578.0, 0.043, 0.0, T_))
+    df = float(np.exp(-0.043 * T_))
+    Ks = np.arange(540.0, 616.0, 5.0)
+    C = black.price(578.0, Ks, T_, 0.043, 0.0, 0.22, 1)
+    P = black.price(578.0, Ks, T_, 0.043, 0.0, 0.22, -1)
+
+    clean = implied_forward(Ks, C, P, T_, S_ref=578.0, df_known=df)
+    assert clean.F == pytest.approx(F, abs=1e-6)
+    P_bad = P.copy()
+    P_bad[-2] += 70.0                                   # the MA-shaped corruption
+    dirty = implied_forward(Ks, C, P_bad, T_, S_ref=578.0, df_known=df)
+
+    assert dirty.n_dropped == 1
+    assert dirty.F == pytest.approx(clean.F, abs=1e-9)
+    assert clean.n_dropped == 0, "the screen must not trim a chain that is fine"
+
+
+def test_the_screen_keeps_the_legitimate_wing_trend():
+    """Early exercise makes the per-strike estimates fan out smoothly.  That is
+    signal about American-ness, not a corrupt print, and trimming it would bias
+    the forward toward whichever wing happened to survive.  Measured live, the
+    legitimate fan reached 243 bp while corrupt rows sat at 989-1522 bp."""
+    from optionsmarkets.pricing.american import leisen_reimer
+
+    S, r, T_ = 768.0, 0.04, 0.10
+    Ks = np.arange(700.0, 840.0, 5.0)
+    C = np.array([leisen_reimer(S, k, T_, r, 0.011, 0.14, 1, n=201) for k in Ks])
+    P = np.array([leisen_reimer(S, k, T_, r, 0.011, 0.14, -1, n=201) for k in Ks])
+    fit = implied_forward(Ks, C, P, T_, S_ref=S, df_known=float(np.exp(-r * T_)))
+    assert fit.n_dropped == 0, "the American fan is not an outlier population"
+    assert fit.ok

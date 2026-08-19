@@ -11,7 +11,8 @@
       "Bash(.venv/bin/python examples/end_to_end.py)",
       "Bash(timeout 25 .venv/bin/python -m pip download --no-deps -q -d /tmp/_probe yfinance)",
       "Bash(echo \"EXIT=$?\")",
-      "Read(//tmp/**)"
+      "Read(//tmp/**)",
+      "Bash(.venv/bin/python -c ' *)"
     ]
   }
 }

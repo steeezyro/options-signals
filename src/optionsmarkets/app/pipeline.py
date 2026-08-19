@@ -173,7 +173,8 @@ class Pipeline:
             res.asof, res.spot = chain.asof, chain.spot
             quote_age = chain.age_s(now)
 
-            expiries, T_by_exp = self._select_expiries(chain, now, notes)
+            earnings = self._next_earnings(notes)
+            expiries, T_by_exp = self._select_expiries(chain, now, notes, earnings)
             decision_expiry = expiries[0]
             res.expiry = decision_expiry
             res.dte = (decision_expiry - now.date()).days
@@ -188,8 +189,10 @@ class Pipeline:
                     "data.quality", False,
                     f"{res.quality.verdict}: " + "; ".join(res.quality.detail)))
 
-            rates, q_yield, divs, days_to_earnings = self._carry_and_events(
+            rates, q_yield, divs = self._carry_and_events(
                 chain, expiries, T_by_exp, notes)
+            days_to_earnings = ((earnings - chain.asof.date()).days
+                                if earnings is not None else None)
 
             # The policy's risk.event_window gate measures days from TODAY, which
             # blocks entering ON an earnings date but not entering a 32-DTE trade
@@ -310,7 +313,8 @@ class Pipeline:
         return chain
 
     def _select_expiries(self, chain: ChainSnapshot, now: datetime,
-                         notes: list[str]) -> tuple[list[date], dict[date, float]]:
+                         notes: list[str], earnings: date | None = None,
+                         ) -> tuple[list[date], dict[date, float]]:
         """Pick the decision expiry, plus neighbours for the surface.
 
         The FIRST returned expiry is the decision expiry; the rest exist so the
@@ -342,7 +346,21 @@ class Pipeline:
             notes.append(f"no expiry in the {lo_t}-{hi_t} DTE target band; falling back "
                          f"to the wider {lo_g}-{hi_g} policy window")
 
-        pick = self._prefer(band, dte)
+        # Drop expiries that are listed but dead before applying the preference.
+        # Being listed is not the same as being quoted: MA on 2026-08-18 listed a
+        # 2026-10-02 expiry with ZERO strikes carrying a two-sided market on both
+        # legs, and 'furthest' selected it over three live expiries in the same
+        # band -- then the run HELD at data.iv_inversion for want of a slice.
+        # Refusing is right when nothing is tradeable; refusing because the
+        # SELECTION landed on the one dead expiry is a self-inflicted HOLD.
+        live = [e for e in band if self._sliceable(chain, e)]
+        if live and len(live) != len(band):
+            notes.append(f"{len(band) - len(live)} of {len(band)} in-band expiries "
+                         f"carry too few two-sided strikes to fit a slice; skipped "
+                         f"in selection")
+            band = live
+
+        pick = self._prefer(band, dte, earnings, notes)
 
         # The trade must have room to live. A structure entered at or just above
         # the time stop is closed before it has earned any of the premium that
@@ -367,13 +385,58 @@ class Pipeline:
         T_by = {e: max(dte[e], 1) / 365.0 for e in chosen}
         return chosen, T_by
 
-    def _prefer(self, band: list[date], dte: dict[date, int]) -> date:
+    def _sliceable(self, chain: ChainSnapshot, e: date) -> bool:
+        """Cheap proxy for "``_slices`` will get a slice out of this expiry".
+
+        Mirrors the two counts that stage actually enforces -- at least 3 paired
+        strikes near the money for the parity fit, and at least 5 tradeable
+        strikes for the IV inversion -- without doing either. It is deliberately
+        optimistic: it screens out the dead expiries, and ``data.iv_inversion``
+        still backstops the ones that look alive and are not.
+        """
+        cfg = self.cfg
+        by_k: dict[float, dict] = {}
+        n_tradeable = 0
+        for q in chain.for_expiry(e):
+            if q.tradeable(cfg.chain_max_rel_spread, cfg.chain_min_open_interest):
+                n_tradeable += 1
+            by_k.setdefault(float(q.strike), {})[q.right] = q
+        n_paired = sum(
+            1 for k, v in by_k.items()
+            if len(v) == 2 and np.isfinite(v[Right.CALL].mid) and np.isfinite(v[Right.PUT].mid)
+            and (not np.isfinite(chain.spot) or abs(k / chain.spot - 1.0) <= 0.10))
+        return n_paired >= 3 and n_tradeable >= 5
+
+    def _prefer(self, band: list[date], dte: dict[date, int],
+                earnings: date | None = None, notes: list[str] | None = None) -> date:
+        """Apply ``expiry_preference`` to the band, avoiding an earnings straddle.
+
+        The earnings filter is a SELECTION rule, not a relaxation of the
+        ``risk.event_in_window`` gate -- that gate is untouched and still fires
+        if no clean expiry exists. The two do different jobs: the gate says an
+        expiry spanning earnings carries an event premium its implied vol cannot
+        be compared against a diffusive forecast; this says that when the band
+        also contains an expiry that does NOT span earnings, that one is the
+        expiry the strategy is actually about.
+
+        Observed live 2026-08-18: MU had earnings in 36 days, 'furthest' picked
+        the 38-DTE expiry, and the run HELD -- while the 24- and 31-DTE expiries
+        in the same band expired cleanly before the event and were tradeable.
+        The whole quarter would have been unreachable for every single name that
+        reports, which is most of them.
+        """
         pref = self.cfg.expiry_preference
+        clean = band
+        if earnings is not None:
+            clean = [e for e in band if e < earnings] or band
+            if len(clean) != len(band) and notes is not None:
+                notes.append(f"earnings {earnings}: restricted the {len(band)}-expiry "
+                             f"target band to the {len(clean)} expiring before it")
         if pref == "nearest":
-            return band[0]
+            return clean[0]
         if pref == "furthest":
-            return band[-1]
-        return band[len(band) // 2]                     # 'mid'
+            return clean[-1]
+        return clean[len(clean) // 2]                   # 'mid'
 
     # ---- 3. rates, carry, events -------------------------------------
     def _carry_and_events(self, chain: ChainSnapshot, expiries: list[date],
@@ -399,13 +462,20 @@ class Pipeline:
             notes.append(f"dividend feed unavailable ({exc}); using the configured "
                          f"yield {cfg.fallback_dividend_yield:.4%}")
 
-        days_to_earnings: int | None = None
+        return rates, q_yield, divs
+
+    def _next_earnings(self, notes: list[str]) -> date | None:
+        """The next earnings date, or None.
+
+        Fetched BEFORE the expiry is chosen, not alongside the rest of the carry
+        data, because expiry selection needs it: see ``_prefer``. The policy
+        decision about an *unavailable* calendar stays here and stays fail-closed
+        -- an unknown event date is not the same as no event.
+        """
         try:
-            nxt = self.provider.next_earnings(cfg.symbol)
-            if nxt is not None:
-                days_to_earnings = (nxt - chain.asof.date()).days
+            return self.provider.next_earnings(self.cfg.symbol)
         except Exception as exc:
-            if cfg.earnings_unknown_action == "block":
+            if self.cfg.earnings_unknown_action == "block":
                 raise PipelineAbort(Gate(
                     "risk.event_window", False,
                     f"earnings calendar unavailable ({exc}) and the policy is set "
@@ -414,7 +484,7 @@ class Pipeline:
                     f"different math.")) from exc
             notes.append(f"earnings calendar unavailable ({exc}); event gate skipped "
                          f"by configuration")
-        return rates, q_yield, divs, days_to_earnings
+            return None
 
     # ---- 4/5. forward + IV inversion ---------------------------------
     def _slices(self, chain: ChainSnapshot, expiries: list[date],
@@ -439,16 +509,30 @@ class Pipeline:
                 notes.append(f"{e}: only {len(paired)} paired strikes; slice skipped")
                 continue
 
+            # DF comes from the curve; only F is fitted. These are AMERICAN
+            # quotes, and letting the regression estimate DF off a +/-10% strike
+            # lever arm absorbs the early-exercise premium into the discount
+            # factor -- measured live on 2026-08-18, that returned DF > 1 (a
+            # negative implied rate) on every underlying and blocked every
+            # decision at data.iv_inversion. pricing/forward.py has the numbers.
             ff = implied_forward(
                 paired, [by_k[k][Right.CALL].mid for k in paired],
                 [by_k[k][Right.PUT].mid for k in paired], T,
                 weights=[1.0 / max(by_k[k][Right.CALL].spread
                                    + by_k[k][Right.PUT].spread, 1e-3) for k in paired],
-                S_ref=chain.spot, atm_window=0.10)
+                S_ref=chain.spot, atm_window=0.10,
+                df_known=float(np.exp(-rates[e] * T)))
             if not ff.ok:
-                notes.append(f"{e}: put-call parity regression failed "
-                             f"(F={ff.F}, DF={ff.DF}, n={ff.n_pairs}); slice skipped")
+                notes.append(f"{e}: put-call parity fit failed "
+                             f"(F={ff.F}, DF={ff.DF}, n={ff.n_pairs}, "
+                             f"resid={ff.residual_bp:.0f}bp); slice skipped")
                 continue
+            if ff.n_dropped:
+                # Named, not silent: a dropped strike is a quote the vendor got
+                # wrong, and the count is the only warning you get that the feed
+                # is degrading before it degrades past the screen.
+                notes.append(f"{e}: {ff.n_dropped} strike(s) rejected by the parity "
+                             f"outlier screen (uncorrectable vendor quotes)")
             fwds[e] = ff
 
             ks, ivs, sps = [], [], []
